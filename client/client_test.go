@@ -740,7 +740,7 @@ func setupClientBenchData(numVersions, numKeys int, b *testing.B) (*server.TestS
 	s.SkipBootstrap = exists
 	s.Engine = engine.NewRocksDB(proto.Attributes{Attrs: []string{"ssd"}}, loc, cacheSize)
 	if err := s.Start(); err != nil {
-		b.Fatalf("Could not start server: %v", err)
+		b.Fatal(err)
 	}
 
 	// httpClient, err := testutils.NewTestHTTPClient()

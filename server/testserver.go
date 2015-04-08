@@ -31,7 +31,7 @@ import (
 )
 
 // StartTestServer starts a in-memory test server.
-func StartTestServer(t *testing.T) *TestServer {
+func StartTestServer(t testing.TB) *TestServer {
 	s := &TestServer{}
 	if err := s.Start(); err != nil {
 		if t != nil {
@@ -71,10 +71,7 @@ func NewTestContext() *Context {
 // A TestServer encapsulates an in-memory instantiation of a cockroach
 // node with a single store. Example usage of a TestServer follows:
 //
-//   s := &server.TestServer{}
-//   if err := s.Start(); err != nil {
-//     t.Fatal(err)
-//   }
+//   s := server.StartTestServer(t)
 //   defer s.Stop()
 //
 // TODO(spencer): add support for multiple stores.
@@ -117,7 +114,7 @@ func (ts *TestServer) Start() error {
 	var err error
 	ts.Server, err = NewServer(ts.Ctx, util.NewStopper())
 	if err != nil {
-		return util.Errorf("could not init server: %s", err)
+		return err
 	}
 
 	if ts.Engine == nil {
@@ -128,13 +125,13 @@ func (ts *TestServer) Start() error {
 		stopper := util.NewStopper()
 		_, err := BootstrapCluster("cluster-1", ts.Engine, stopper)
 		if err != nil {
-			return util.Errorf("could not bootstrap cluster: %s", err)
+			return err
 		}
 		stopper.Stop()
 	}
 	err = ts.Server.Start(true)
 	if err != nil {
-		return util.Errorf("could not start server: %s", err)
+		return err
 	}
 
 	return nil

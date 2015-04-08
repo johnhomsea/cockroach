@@ -29,41 +29,24 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
 	. "github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/server"
-	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/testutils"
-	"github.com/cockroachdb/cockroach/util"
 	gogoproto "github.com/gogo/protobuf/proto"
 )
 
 // startServer returns the server, server address and a KV client for
 // access to the underlying database. The server should be closed by
 // the caller.
-func startServer(t *testing.T) (string, *client.KV, *util.Stopper) {
-	// Initialize engine, store, and localDB.
-	e := engine.NewInMem(proto.Attributes{}, 1<<20)
-	stopper := util.NewStopper()
-	db, err := server.BootstrapCluster("test-cluster", e, stopper)
-	if err != nil {
-		t.Fatalf("could not bootstrap test cluster: %s", err)
-	}
-	mux := http.NewServeMux()
-	mux.Handle(RESTPrefix, NewRESTServer(db))
-	mux.Handle(DBPrefix, NewDBServer(db.Sender))
-	server := httptest.NewTLSServer(mux)
-	stopper.AddCloser(server)
-	addr := server.Listener.Addr().String()
-	return addr, db, stopper
+func startServer(t testing.TB) *server.TestServer {
+	return server.StartTestServer(t)
 }
 
 // HTTP methods, defined in RFC 2616.
@@ -82,8 +65,8 @@ type protoResp struct {
 }
 
 func TestMethods(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	testKey, testVal := "Hello, 世界", "世界 is cool"
 	testCases := []struct {
@@ -120,7 +103,7 @@ func TestMethods(t *testing.T) {
 		{methodGet, testKey, nil, http.StatusNotFound, nil},
 	}
 	for _, tc := range testCases {
-		resp, err := httpDo(addr, tc.method, EntryPrefix+tc.key, tc.body)
+		resp, err := httpDo(s.ServingAddr(), tc.method, EntryPrefix+tc.key, tc.body)
 		if err != nil {
 			t.Errorf("[%s] %s: error making request: %s", tc.method, tc.key, err)
 			continue
@@ -155,11 +138,11 @@ func TestMethods(t *testing.T) {
 }
 
 func TestRange(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	// Create range of keys (with counters interspersed).
-	baseURL := "https://" + addr
+	baseURL := "https://" + s.ServingAddr()
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("key_%.2d", i)
 		val := fmt.Sprintf("value_%.2d", i)
@@ -203,7 +186,7 @@ func TestRange(t *testing.T) {
 	}
 	// Delete limit of that range. Start: 5, end: 99, limit: 25 –> keys 5-30 deleted.
 	path := fmt.Sprintf("%s?start=key_%.2d&end=key_%.2d&limit=%d", RangePrefix, start, end, limit)
-	resp, err := httpDo(addr, methodDelete, path, nil)
+	resp, err := httpDo(s.ServingAddr(), methodDelete, path, nil)
 	if err != nil {
 		t.Errorf("error attempting to delete range: %s", err)
 	}
@@ -233,7 +216,7 @@ func TestRange(t *testing.T) {
 	// Delete remaining range.
 	start, end = 0, 99
 	path = fmt.Sprintf("%s?start=key_%.2d&end=key_%.2d", RangePrefix, start, end)
-	resp, err = httpDo(addr, methodDelete, path, nil)
+	resp, err = httpDo(s.ServingAddr(), methodDelete, path, nil)
 	if err != nil {
 		t.Errorf("error attempting to delete range: %s", err)
 	}
@@ -289,8 +272,8 @@ func checkStatus(resp *http.Response, t *testing.T) {
 }
 
 func TestIncrement(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	testKey := "Hello, 世界"
 	testCases := []struct {
@@ -316,7 +299,7 @@ func TestIncrement(t *testing.T) {
 		if tc.statusCode == http.StatusOK && tc.method == methodPost {
 			body = strings.NewReader(strconv.Itoa(tc.val))
 		}
-		resp, err := httpDo(addr, tc.method, CounterPrefix+tc.key, body)
+		resp, err := httpDo(s.ServingAddr(), tc.method, CounterPrefix+tc.key, body)
 		if err != nil {
 			t.Errorf("[%s] %s: error making request: %s", tc.method, tc.key, err)
 			continue
@@ -346,8 +329,8 @@ func TestIncrement(t *testing.T) {
 }
 
 func TestMixingCounters(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	entryKey := "value"
 	counterKey := "counter"
@@ -385,7 +368,7 @@ func TestMixingCounters(t *testing.T) {
 		if tc.statusCode == http.StatusOK && tc.method == methodPost {
 			body = strings.NewReader("1")
 		}
-		resp, err := httpDo(addr, tc.method, prefix+key, body)
+		resp, err := httpDo(s.ServingAddr(), tc.method, prefix+key, body)
 		if err != nil {
 			t.Errorf("[%s] %s: error making request: %s", tc.method, key, err)
 			continue
@@ -406,8 +389,8 @@ func TestMixingCounters(t *testing.T) {
 // TODO(spencer): we need to ensure proper permissions through the
 // HTTP API.
 func TestSystemKeys(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	// Compute expected system key.
 	desc := &proto.RangeDescriptor{
@@ -429,7 +412,7 @@ func TestSystemKeys(t *testing.T) {
 	// Manipulate the meta1 key.
 	metaKey := engine.MakeKey(engine.KeyMeta1Prefix, engine.KeyMax)
 	encMeta1Key := url.QueryEscape(string(metaKey))
-	url := "https://" + addr + EntryPrefix + encMeta1Key
+	url := "https://" + s.ServingAddr() + EntryPrefix + encMeta1Key
 	resp := getURL(url, t)
 	var pr protoResp
 	if err := json.Unmarshal([]byte(resp), &pr); err != nil {
@@ -451,12 +434,12 @@ func TestSystemKeys(t *testing.T) {
 }
 
 func TestKeysAndBodyArePreserved(t *testing.T) {
-	addr, db, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	encKey := "%00some%2Fkey%20that%20encodes%E4%B8%96%E7%95%8C"
 	encBody := "%00some%2FBODY%20that%20encodes"
-	url := "https://" + addr + EntryPrefix + encKey
+	url := "https://" + s.ServingAddr() + EntryPrefix + encKey
 	postURL(url, strings.NewReader(encBody), t)
 	resp := getURL(url, t)
 	var pr protoResp
@@ -466,18 +449,14 @@ func TestKeysAndBodyArePreserved(t *testing.T) {
 	if !bytes.Equal([]byte(encBody), pr.Value.Bytes) {
 		t.Fatalf("expected body to be %q; got %q", encBody, string(pr.Value.Bytes))
 	}
-	gr := &proto.GetResponse{}
-	if err := db.Run(client.Call{
-		Args: &proto.GetRequest{
-			RequestHeader: proto.RequestHeader{
-				Key:  proto.Key("\x00some/key that encodes世界"),
-				User: storage.UserRoot,
-			},
-		}, Reply: gr}); err != nil {
-		t.Errorf("unable to fetch values from local db: %s", err)
+	// Lookup results direclty from the underlying engine.
+	key := proto.Key("\x00some/key that encodes世界")
+	val, err := engine.MVCCGet(s.Engine, key, s.Clock().Now(), false, nil)
+	if err != nil {
+		t.Errorf("unable to fetch value for key %s: %s", key, err)
 	}
-	if !bytes.Equal(gr.Value.Bytes, []byte(encBody)) {
-		t.Errorf("expected %q; got %q", encBody, gr.Value.Bytes)
+	if !bytes.Equal(val.Bytes, []byte(encBody)) {
+		t.Errorf("expected %q; got %q", encBody, val.Bytes)
 	}
 }
 
