@@ -80,8 +80,8 @@ type rangeScanner struct {
 	scanFn   func()         // Function called at each complete scan iteration
 	// Count of times through the scanning loop but locked by the completedScan
 	// mutex.
-	count         int64
 	completedScan *sync.Cond
+	count         int64
 }
 
 // newRangeScanner creates a new range scanner with the provided loop interval,

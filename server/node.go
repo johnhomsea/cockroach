@@ -20,6 +20,7 @@ package server
 import (
 	"container/list"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -44,6 +45,8 @@ const (
 	gossipInterval = 1 * time.Minute
 )
 
+// TODO(Bram): Add a type alias for NodeServer to expose RPC methods.
+
 // A Node manages a map of stores (by store ID) for which it serves
 // traffic. A node is the top-level data structure. There is one node
 // instance per process. A node accepts incoming RPCs and services
@@ -58,6 +61,11 @@ type Node struct {
 	Descriptor gossip.NodeDescriptor // Node ID, network/physical topology
 	ctx        storage.StoreContext  // Context to use and pass to stores
 	lSender    *kv.LocalSender       // Local KV sender for access to node-local stores
+	startedAt  int64
+	// ScanCount is the number of times through the store scanning loop locked
+	// by the completedScan mutex.
+	completedScan *sync.Cond
+	scanCount     int64
 }
 
 // allocateNodeID increments the node id generator key to allocate
@@ -158,8 +166,9 @@ func BootstrapCluster(clusterID string, eng engine.Engine, stopper *util.Stopper
 // NewNode returns a new instance of Node.
 func NewNode(ctx storage.StoreContext) *Node {
 	return &Node{
-		ctx:     ctx,
-		lSender: kv.NewLocalSender(),
+		ctx:           ctx,
+		lSender:       kv.NewLocalSender(),
+		completedScan: sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -221,6 +230,9 @@ func (n *Node) start(rpcServer *rpc.Server, engines []engine.Engine,
 	if err := n.initStores(engines, stopper); err != nil {
 		return err
 	}
+
+	n.startedAt = n.ctx.Clock.Now().WallTime
+	n.startStoresScanner(stopper)
 	n.startGossip(stopper)
 	log.Infof("Started node with %v engine(s) and attributes %v", engines, attrs.Attrs)
 	return nil
@@ -388,6 +400,94 @@ func (n *Node) gossipCapacities() {
 		s.GossipCapacity(&n.Descriptor)
 		return nil
 	})
+}
+
+// storesScanner will walk through all the stores in the node every
+// ctx.ScanInterval and store the status in the db.
+func (n *Node) startStoresScanner(stopper *util.Stopper) {
+	stopper.RunWorker(func() {
+		start := time.Now()
+		for {
+			elapsed := time.Now().Sub(start)
+			remainingNanos := n.ctx.ScanInterval.Nanoseconds() - elapsed.Nanoseconds()
+			if remainingNanos < 0 {
+				remainingNanos = 0
+			}
+			nextIteration := time.Duration(remainingNanos)
+			log.V(6).Infof("next store scan iteration in %s", nextIteration)
+
+			select {
+			case <-time.After(nextIteration):
+				if !stopper.StartTask() {
+					continue
+				}
+
+				// Walk through all the stores on this node.
+				rangeCount := 0
+				stats := &proto.MVCCStats{}
+				storeIDs := n.lSender.GetStoreIDs()
+				accessedStoreIDs := make([]int32, 0, len(storeIDs))
+				for _, storeID := range storeIDs {
+					store, err := n.lSender.GetStore(storeID)
+					if err != nil {
+						// The rare case were a store was removed between
+						// listing the store ids and fetching their status.
+						log.Info("non-fatal error returned when scanning stores of node %v: %v", n.Descriptor.NodeID, err)
+						continue
+					}
+					storeStatus, err := store.GetStatus()
+					if err != nil {
+						log.Error(err)
+					}
+					if storeStatus == nil {
+						// The store scanner hasn't run on this node yet.
+						continue
+					}
+					accessedStoreIDs = append(accessedStoreIDs, int32(storeID))
+					rangeCount += int(storeStatus.RangeCount)
+					engine.Accumulate(stats, storeStatus.Stats)
+				}
+
+				// Store the combined stats in the db.
+				now := n.ctx.Clock.Now().WallTime
+				status := &proto.NodeStatus{
+					NodeID:     n.Descriptor.NodeID,
+					StoreIDs:   accessedStoreIDs,
+					UpdatedAt:  now,
+					StartedAt:  n.startedAt,
+					RangeCount: int32(rangeCount),
+					Stats:      *stats,
+				}
+				key := engine.NodeStatusKey(int32(n.Descriptor.NodeID))
+				if err := n.ctx.DB.Run(client.PutProtoCall(key, status)); err != nil {
+					log.Error(err)
+				}
+				// Increment iteration count.
+				n.completedScan.L.Lock()
+				n.scanCount++
+				n.completedScan.Broadcast()
+				n.completedScan.L.Unlock()
+				start = time.Now()
+				log.V(6).Infof("reset store scan iteration")
+				stopper.FinishTask()
+			case <-stopper.ShouldStop():
+				// Exit the loop.
+				return
+			}
+		}
+	})
+}
+
+// WaitForScanCompletion waits until the end of the next store scan and returns
+// the total number of scans completed so far.
+func (n *Node) WaitForScanCompletion() int64 {
+	n.completedScan.L.Lock()
+	defer n.completedScan.L.Unlock()
+	initalValue := n.scanCount
+	for n.scanCount == initalValue {
+		n.completedScan.Wait()
+	}
+	return n.scanCount
 }
 
 // executeCmd creates a client.Call struct and sends if via our local sender.
