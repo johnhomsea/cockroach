@@ -159,10 +159,18 @@ void DBBatchDestroy(DBBatch* batch);
 void DBBatchPut(DBBatch* batch, DBSlice key, DBSlice value);
 
 // Merge the database entry (if any) for "key" with "value".
-void DBBatchMerge(DBBatch* batch, DBSlice key, DBSlice value);
+DBStatus DBBatchMerge(DBBatch* batch, DBSlice key, DBSlice value);
+
+// Retrieves the database entry for "key" within the specified
+// batch. If the key has not been put or deleted within the batch it
+// is retrieved from the base db.
+DBStatus DBBatchGet(DBEngine* db, DBBatch* batch, DBSlice key, DBString* value);
 
 // Deletes the database entry for "key".
 void DBBatchDelete(DBBatch* batch, DBSlice key);
+
+// TODO(pmattis): document
+DBIterator* DBBatchNewIter(DBEngine* db, DBBatch* batch);
 
 // Implements the merge operator on a single pair of values. update is
 // merged with existing. This method is provided for invocation from

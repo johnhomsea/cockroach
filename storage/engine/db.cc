@@ -26,6 +26,7 @@
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
+#include "rocksdb/utilities/write_batch_with_index.h"
 #include "cockroach/proto/api.pb.h"
 #include "cockroach/proto/data.pb.h"
 #include "cockroach/proto/internal.pb.h"
@@ -39,7 +40,11 @@ extern "C" {
 extern "C" {
 
 struct DBBatch {
-  rocksdb::WriteBatch rep;
+  rocksdb::WriteBatchWithIndex rep;
+
+  DBBatch()
+      : rep(rocksdb::BytewiseComparator(), 0, true) {
+  }
 };
 
 struct DBEngine {
@@ -79,10 +84,21 @@ rocksdb::Slice ToSlice(DBSlice s) {
   return rocksdb::Slice(s.data, s.len);
 }
 
+rocksdb::Slice ToSlice(DBString s) {
+  return rocksdb::Slice(s.data, s.len);
+}
+
 DBSlice ToDBSlice(const rocksdb::Slice& s) {
   DBSlice result;
   result.data = const_cast<char*>(s.data());
   result.len = s.size();
+  return result;
+}
+
+DBSlice ToDBSlice(const DBString& s) {
+  DBSlice result;
+  result.data = s.data;
+  result.len = s.len;
   return result;
 }
 
@@ -675,8 +691,12 @@ class DBMergeOperator : public rocksdb::MergeOperator {
       rocksdb::Warn(logger, "corrupted operand value");
       return false;
     }
-    return MergeValues(meta->mutable_value(), operand_meta.value(),
-            full_merge, logger);
+    fprintf(stderr, "MergeOne(pre): '%s' '%s'\n", meta->value().bytes().c_str(),
+            operand_meta.value().bytes().c_str());
+    bool result = MergeValues(meta->mutable_value(), operand_meta.value(),
+                              full_merge, logger);
+    fprintf(stderr, "MergeOne(post): '%s'\n", meta->value().bytes().c_str());
+    return result;
   }
 };
 
@@ -737,6 +757,219 @@ class DBLogger : public rocksdb::Logger {
 
  private:
   const bool enabled_;
+};
+
+// This was cribbed from RocksDB and modified to support merge
+// records.
+class BaseDeltaIterator : public rocksdb::Iterator {
+ public:
+  BaseDeltaIterator(rocksdb::Iterator* base_iterator, rocksdb::WBWIIterator* delta_iterator)
+      : current_at_base_(true),
+        equal_keys_(false),
+        status_(rocksdb::Status::OK()),
+        base_iterator_(base_iterator),
+        delta_iterator_(delta_iterator),
+        comparator_(rocksdb::BytewiseComparator()) {
+    merged_.data = NULL;
+  }
+
+  virtual ~BaseDeltaIterator() {
+    ClearMerged();
+  }
+
+  bool Valid() const override {
+    return current_at_base_ ? BaseValid() : DeltaValid();
+  }
+
+  void SeekToFirst() override {
+    base_iterator_->SeekToFirst();
+    delta_iterator_->SeekToFirst();
+    UpdateCurrent();
+  }
+
+  void SeekToLast() override {
+    base_iterator_->SeekToLast();
+    delta_iterator_->SeekToLast();
+    UpdateCurrent();
+  }
+
+  void Seek(const rocksdb::Slice& k) override {
+    base_iterator_->Seek(k);
+    delta_iterator_->Seek(k);
+    UpdateCurrent();
+  }
+
+  void Next() override {
+    if (!Valid()) {
+      status_ = rocksdb::Status::NotSupported("Next() on invalid iterator");
+    }
+    Advance();
+  }
+
+  void Prev() override {
+    status_ = rocksdb::Status::NotSupported("Prev() not supported");
+  }
+
+  rocksdb::Slice key() const override {
+    return current_at_base_ ? base_iterator_->key()
+                            : delta_iterator_->Entry().key;
+  }
+
+  rocksdb::Slice value() const override {
+    if (current_at_base_) {
+      return base_iterator_->value();
+    }
+    const rocksdb::WriteEntry entry = delta_iterator_->Entry();
+    if (entry.type == rocksdb::kMergeRecord && equal_keys_) {
+      return ToSlice(merged_);
+    }
+    return delta_iterator_->Entry().value;
+  }
+
+  rocksdb::Status status() const override {
+    if (!status_.ok()) {
+      return status_;
+    }
+    if (!base_iterator_->status().ok()) {
+      return base_iterator_->status();
+    }
+    return delta_iterator_->status();
+  }
+
+ private:
+  // -1 -- delta less advanced than base
+  // 0 -- delta == base
+  // 1 -- delta more advanced than base
+  int Compare() const {
+    assert(delta_iterator_->Valid() && base_iterator_->Valid());
+    return comparator_->Compare(delta_iterator_->Entry().key,
+                                base_iterator_->key());
+  }
+  bool IsDeltaDelete() {
+    assert(DeltaValid());
+    return delta_iterator_->Entry().type == rocksdb::kDeleteRecord;
+  }
+  void AssertInvariants() {
+#ifndef NDEBUG
+    if (!Valid()) {
+      return;
+    }
+    if (!BaseValid()) {
+      assert(!current_at_base_ && delta_iterator_->Valid());
+      return;
+    }
+    if (!DeltaValid()) {
+      assert(current_at_base_ && base_iterator_->Valid());
+      return;
+    }
+    // we don't support those yet
+    assert(delta_iterator_->Entry().type != rocksdb::kLogDataRecord);
+    int compare = comparator_->Compare(delta_iterator_->Entry().key,
+                                       base_iterator_->key());
+    // current_at_base -> compare < 0
+    assert(!current_at_base_ || compare < 0);
+    // !current_at_base -> compare <= 0
+    assert(current_at_base_ && compare >= 0);
+    // equal_keys_ <=> compare == 0
+    assert((equal_keys_ || compare != 0) && (!equal_keys_ || compare == 0));
+#endif
+  }
+
+  void Advance() {
+    if (equal_keys_) {
+      assert(BaseValid() && DeltaValid());
+      AdvanceBase();
+      AdvanceDelta();
+    } else {
+      if (current_at_base_) {
+        assert(BaseValid());
+        AdvanceBase();
+      } else {
+        assert(DeltaValid());
+        AdvanceDelta();
+      }
+    }
+    UpdateCurrent();
+  }
+
+  void AdvanceDelta() {
+    delta_iterator_->Next();
+    ClearMerged();
+  }
+  void AdvanceBase() {
+    base_iterator_->Next();
+  }
+  bool BaseValid() const { return base_iterator_->Valid(); }
+  bool DeltaValid() const { return delta_iterator_->Valid(); }
+  void UpdateCurrent() {
+    ClearMerged();
+    while (true) {
+      equal_keys_ = false;
+      if (!BaseValid()) {
+        // Base has finished.
+        if (!DeltaValid()) {
+          // Finished
+          return;
+        }
+        if (IsDeltaDelete()) {
+          AdvanceDelta();
+        } else {
+          current_at_base_ = false;
+          return;
+        }
+      } else if (!DeltaValid()) {
+        // Delta has finished.
+        current_at_base_ = true;
+        return;
+      } else {
+        int compare = Compare();
+        if (compare <= 0) {  // delta bigger or equal
+          if (compare == 0) {
+            equal_keys_ = true;
+          }
+          if (!IsDeltaDelete()) {
+            current_at_base_ = false;
+
+            rocksdb::WriteEntry entry = delta_iterator_->Entry();
+            if (entry.type == rocksdb::kMergeRecord) {
+              DBStatus status = DBMergeOne(
+                  ToDBSlice(base_iterator_->value()), ToDBSlice(entry.value), &merged_);
+              if (status.data != NULL) {
+                status_ = rocksdb::Status::Corruption("unable to merge records");
+                return;
+              }
+            }
+            return;
+          }
+          // Delta is less advanced and is delete.
+          AdvanceDelta();
+          if (equal_keys_) {
+            AdvanceBase();
+          }
+        } else {
+          current_at_base_ = true;
+          return;
+        }
+      }
+    }
+
+    AssertInvariants();
+  }
+
+  void ClearMerged() const {
+    if (merged_.data != NULL) {
+      free(merged_.data);
+      merged_.data = NULL;
+    }
+  }
+
+  bool current_at_base_;
+  bool equal_keys_;
+  mutable rocksdb::Status status_;
+  mutable DBString merged_;
+  std::unique_ptr<rocksdb::Iterator> base_iterator_;
+  std::unique_ptr<rocksdb::WBWIIterator> delta_iterator_;
+  const rocksdb::Comparator* comparator_;  // not owned
 };
 
 }  // namespace
@@ -855,7 +1088,7 @@ DBStatus DBDelete(DBEngine* db, DBSlice key) {
 
 DBStatus DBWrite(DBEngine* db, DBBatch *batch) {
   rocksdb::WriteOptions options;
-  return ToDBStatus(db->rep->Write(options, &batch->rep));
+  return ToDBStatus(db->rep->Write(options, batch->rep.GetWriteBatch()));
 }
 
 DBSnapshot* DBNewSnapshot(DBEngine* db)  {
@@ -925,12 +1158,90 @@ void DBBatchPut(DBBatch* batch, DBSlice key, DBSlice value) {
   batch->rep.Put(ToSlice(key), ToSlice(value));
 }
 
-void DBBatchMerge(DBBatch* batch, DBSlice key, DBSlice value) {
-  batch->rep.Merge(ToSlice(key), ToSlice(value));
+DBStatus DBBatchMerge(DBBatch* batch, DBSlice key, DBSlice value) {
+  // batch->rep.Merge(ToSlice(key), ToSlice(value));
+  // return kSuccess;
+
+  std::unique_ptr<rocksdb::WBWIIterator> iter(batch->rep.NewIterator());
+  rocksdb::Slice rkey = ToSlice(key);
+  iter->Seek(rkey);
+  if (!iter->Valid() || iter->Entry().key != rkey) {
+    fprintf(stderr, "DBBatchMerge(new)\n");
+    batch->rep.Merge(ToSlice(key), ToSlice(value));
+    return kSuccess;
+  }
+
+  const rocksdb::WriteEntry entry = iter->Entry();
+  if (entry.type == rocksdb::kDeleteRecord) {
+    fprintf(stderr, "DBBatchMerge(existing is delete)\n");
+    batch->rep.Merge(ToSlice(key), ToSlice(value));
+    return kSuccess;
+  }
+
+  DBString merged_value;
+  DBStatus status = DBMergeOne(ToDBSlice(entry.value), value, &merged_value);
+  if (status.data != NULL) {
+    return status;
+  }
+
+  fprintf(stderr, "DBBatchMerge(merge)\n");
+  batch->rep.Merge(ToSlice(key), ToSlice(merged_value));
+  free(merged_value.data);
+  return kSuccess;
+}
+
+DBStatus DBBatchGet(DBEngine* db, DBBatch* batch, DBSlice key, DBString* value) {
+  std::unique_ptr<rocksdb::WBWIIterator> iter(batch->rep.NewIterator());
+  rocksdb::Slice rkey = ToSlice(key);
+  iter->Seek(rkey);
+
+  if (iter->Valid() && iter->Entry().key == rkey) {
+    const rocksdb::WriteEntry entry = iter->Entry();
+    switch (entry.type) {
+      case rocksdb::kPutRecord:
+        *value = ToDBString(entry.value);
+        return kSuccess;
+      case rocksdb::kMergeRecord: {
+        DBString existing;
+        DBStatus status = DBGet(db, NULL, key, &existing);
+        if (status.data != NULL) {
+          return status;
+        }
+        if (existing.data != NULL) {
+          DBStatus status = DBMergeOne(ToDBSlice(existing), ToDBSlice(entry.value), value);
+          free(existing.data);
+          if (status.data != NULL) {
+            return status;
+          }
+        } else {
+          *value = ToDBString(entry.value);
+        }
+        return kSuccess;
+      }
+      case rocksdb::kDeleteRecord:
+        // This mirrors the logic in DBGet(): a deleted entry is
+        // indicated by a value with NULL data.
+        value->data = NULL;
+        value->len = 0;
+        return kSuccess;
+      default:
+        break;
+    }
+  }
+
+  return DBGet(db, NULL, key, value);
 }
 
 void DBBatchDelete(DBBatch* batch, DBSlice key) {
   batch->rep.Delete(ToSlice(key));
+}
+
+DBIterator* DBBatchNewIter(DBEngine* db, DBBatch* batch) {
+  DBIterator* iter = new DBIterator;
+  rocksdb::Iterator* base = db->rep->NewIterator(MakeReadOptions(NULL));
+  rocksdb::WBWIIterator *delta = batch->rep.NewIterator();
+  iter->rep = new BaseDeltaIterator(base, delta);
+  return iter;
 }
 
 DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
@@ -946,8 +1257,11 @@ DBStatus DBMergeOne(DBSlice existing, DBSlice update, DBString* new_value) {
     return ToDBString("corrupted update value");
   }
 
+  fprintf(stderr, "DBMergeOne(pre): '%s' '%s'\n", meta.value().bytes().c_str(),
+          update_meta.value().bytes().c_str());
   if (!MergeValues(meta.mutable_value(), update_meta.value(), true, NULL)) {
     return ToDBString("incompatible merge values");
   }
+  fprintf(stderr, "DBMergeOne(post): '%s'\n", meta.value().bytes().c_str());
   return MergeResult(&meta, new_value);
 }

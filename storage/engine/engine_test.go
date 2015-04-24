@@ -62,11 +62,11 @@ func runWithAllEngines(test func(e Engine, t *testing.T), t *testing.T) {
 	test(inMem, t)
 }
 
-// TestEngineWriteBatch writes a batch containing 10K rows (all the
+// TestEngineBatchCommit writes a batch containing 10K rows (all the
 // same key) and concurrently attempts to read the value in a tight
 // loop. The test verifies that either there is no value for the key
 // or it contains the final value, but never a value in between.
-func TestEngineWriteBatch(t *testing.T) {
+func TestEngineBatchCommit(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	numWrites := 10000
 	key := proto.EncodedKey("a")
@@ -102,11 +102,12 @@ func TestEngineWriteBatch(t *testing.T) {
 		<-readsBegun
 
 		// Create key/values and put them in a batch to engine.
-		puts := make([]interface{}, numWrites, numWrites)
+		batch := e.NewBatch()
+		defer batch.Close()
 		for i := 0; i < numWrites; i++ {
-			puts[i] = BatchPut{proto.RawKeyValue{Key: key, Value: []byte(strconv.Itoa(i))}}
+			batch.Put(key, []byte(strconv.Itoa(i)))
 		}
-		if err := e.WriteBatch(puts); err != nil {
+		if err := batch.Commit(); err != nil {
 			t.Fatal(err)
 		}
 		close(writesDone)
@@ -117,60 +118,92 @@ func TestEngineWriteBatch(t *testing.T) {
 func TestEngineBatch(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	runWithAllEngines(func(engine Engine, t *testing.T) {
-		numShuffles := 100
+		numShuffles := 1
 		key := proto.EncodedKey("a")
 		// Those are randomized below.
-		batch := []interface{}{
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("~ockroachDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("C~ckroachDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Co~kroachDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Coc~roachDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cock~oachDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cockr~achDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cockro~chDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cockroa~hDB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cockroac~DB")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("Cockroach~B")}},
-			BatchPut{proto.RawKeyValue{Key: key, Value: appender("CockroachD~")}},
-			BatchDelete{proto.RawKeyValue{Key: key}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("C")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender(" o")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("  c")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender(" k")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("r")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender(" o")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("  a")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender(" c")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("h")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender(" D")}},
-			BatchMerge{proto.RawKeyValue{Key: key, Value: appender("  B")}},
+		type data struct {
+			key   proto.EncodedKey
+			value []byte
+			merge bool
+		}
+		batch := []data{
+			// {key, appender("~ockroachDB"), false},
+			// {key, appender("C~ckroachDB"), false},
+			// {key, appender("Co~kroachDB"), false},
+			// {key, appender("Coc~roachDB"), false},
+			// {key, appender("Cock~oachDB"), false},
+			// {key, appender("Cockr~achDB"), false},
+			// {key, appender("Cockro~chDB"), false},
+			// {key, appender("Cockroa~hDB"), false},
+			// {key, appender("Cockroac~DB"), false},
+			// {key, appender("Cockroach~B"), false},
+			// {key, appender("CockroachD~"), false},
+			// {key, nil, false},
+			{key, appender("C"), true},
+			{key, appender(" o"), true},
+			// {key, appender("  c"), true},
+			// {key, appender(" k"), true},
+			// {key, appender("r"), true},
+			// {key, appender(" o"), true},
+			// {key, appender("  a"), true},
+			// {key, appender(" c"), true},
+			// {key, appender("h"), true},
+			// {key, appender(" D"), true},
+			// {key, appender("  B"), true},
+		}
+
+		apply := func(b Engine, d data) {
+			if d.value == nil {
+				b.Clear(d.key)
+			} else if d.merge {
+				b.Merge(d.key, d.value)
+			} else {
+				b.Put(d.key, d.value)
+			}
 		}
 
 		for i := 0; i < numShuffles; i++ {
 			// In each run, create an array of shuffled operations.
-			shuffledIndices := rand.Perm(len(batch))
-			currentBatch := make([]interface{}, len(batch))
-			for k := range currentBatch {
-				currentBatch[k] = batch[shuffledIndices[k]]
-			}
+			// shuffledIndices := rand.Perm(len(batch))
+			// currentBatch := make([]data, len(batch))
+			// for k := range currentBatch {
+			// 	currentBatch[k] = batch[shuffledIndices[k]]
+			// }
+			currentBatch := batch
 			// Reset the key
 			engine.Clear(key)
 			// Run it once with individual operations and remember the result.
 			for i, op := range currentBatch {
-				if err := engine.WriteBatch([]interface{}{op}); err != nil {
+				b := engine.NewBatch()
+				apply(b, op)
+				if err := b.Commit(); err != nil {
 					t.Errorf("batch test: %d: op %v: %v", i, op, err)
 					continue
 				}
 			}
+			fmt.Printf("foo\n")
 			correctValue, _ := engine.Get(key)
+			engine.Clear(key)
 			// Run the whole thing as a batch and compare.
-			if err := engine.WriteBatch(currentBatch); err != nil {
+			b := engine.NewBatch()
+			for _, op := range currentBatch {
+				apply(b, op)
+			}
+			if err := b.Commit(); err != nil {
 				t.Errorf("batch test: %d: %v", i, err)
 				continue
 			}
 			actualValue, _ := engine.Get(key)
 			if !bytes.Equal(actualValue, correctValue) {
-				t.Errorf("batch test: %d: result inconsistent", i)
+				a := &proto.MVCCMetadata{}
+				if err := gogoproto.Unmarshal(actualValue, a); err != nil {
+					panic(err)
+				}
+				c := &proto.MVCCMetadata{}
+				if err := gogoproto.Unmarshal(correctValue, c); err != nil {
+					panic(err)
+				}
+				t.Errorf("batch test: %d: result inconsistent: %+v != %+v", i, a.Value, c.Value)
 			}
 		}
 	}, t)
@@ -604,11 +637,6 @@ func TestSnapshotMethods(t *testing.T) {
 		// Verify Clear is error.
 		if err := snap.Clear(keys[0]); err == nil {
 			t.Error("expected error on Clear to snapshot")
-		}
-
-		// Verify WriteBatch is error.
-		if err := snap.WriteBatch([]interface{}{BatchDelete{proto.RawKeyValue{Key: keys[0]}}}); err == nil {
-			t.Error("expected error on WriteBatch to snapshot")
 		}
 
 		// Verify Merge is error.

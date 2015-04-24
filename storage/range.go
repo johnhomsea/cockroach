@@ -254,13 +254,14 @@ func (r *Range) start(stopper *util.Stopper) {
 
 // Destroy cleans up all data associated with this range.
 func (r *Range) Destroy() error {
-	var deletes []interface{}
 	iter := newRangeDataIterator(r, r.rm.Engine())
 	defer iter.Close()
+	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
 	for ; iter.Valid(); iter.Next() {
-		deletes = append(deletes, engine.BatchDelete{RawKeyValue: proto.RawKeyValue{Key: iter.Key()}})
+		_ = batch.Clear(iter.Key())
 	}
-	return r.rm.Engine().WriteBatch(deletes)
+	return batch.Commit()
 }
 
 // GetMaxBytes atomically gets the range maximum byte limit.
@@ -796,6 +797,8 @@ func (r *Range) executeCmd(index uint64, args proto.Request,
 
 	// Create a new batch for the command to ensure all or nothing semantics.
 	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
+
 	// Create an proto.MVCCStats instance.
 	ms := proto.MVCCStats{}
 
@@ -1840,6 +1843,8 @@ func (r *Range) Snapshot() (raftpb.Snapshot, error) {
 // Append implements the multiraft.WriteableGroupStorage interface.
 func (r *Range) Append(entries []raftpb.Entry) error {
 	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
+
 	for _, ent := range entries {
 		err := engine.MVCCPutProto(batch, nil, engine.RaftLogKey(r.Desc().RaftID, ent.Index),
 			proto.ZeroTimestamp, nil, &ent)
@@ -1872,7 +1877,8 @@ func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
 		return nil
 	}
 
-	batch := engine.NewBatch(r.rm.Engine())
+	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
 
 	// Delete everything in the range and recreate it from the snapshot.
 	for iter := newRangeDataIterator(r, r.rm.Engine()); iter.Valid(); iter.Next() {
